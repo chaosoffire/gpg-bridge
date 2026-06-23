@@ -25,14 +25,14 @@
   The Unix socket path on the remote to forward from.
 
 .PARAMETER Port
-  The local TCP port for gpg-bridge to listen on.
+  The local TCP port for gpg-bridge to listen on. Must be 1-65535.
 
 .PARAMETER RemoteIP
   Optional: IP/hostname to add to the Host line so `ssh user@<ip>` also
-  gets forwarding. If omitted, only the alias gets forwarding.
+  gets forwarding. Must be a single token (no spaces).
 
 .PARAMETER Uninstall
-  Remove gpg-bridge: stops process, deletes binary, unregisters
+  Remove gpg-bridge: stops process, deletes binary + launcher, unregisters
   scheduled task, removes sentinel-tagged SSH config block.
   Leaves allow-loopback-pinentry in gpg-agent.conf (may be needed by
   other tools). Prints a note about it.
@@ -53,13 +53,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# --- Input validation ---
+if ($Port -notmatch '^\d{1,5}$' -or [int]$Port -lt 1 -or [int]$Port -gt 65535) {
+    throw "-Port must be a numeric TCP port (1-65535). Got: $Port"
+}
+if ($RemoteHost -match '[\r\n"]') { throw "-RemoteHost contains illegal characters" }
+if ($RemoteSocket -match '[\r\n]') { throw "-RemoteSocket contains illegal characters" }
+if ($RemoteIP -and ($RemoteIP -match '[\s\r\n"]')) { throw "-RemoteIP must be a single token" }
+
 # --- Constants ---
 $repo = "chaosoffire/gpg-bridge"
 $taskName = "gpg-bridge"
 $binDir = Join-Path $env:USERPROFILE "bin"
 $exePath = Join-Path $binDir "gpg-bridge.exe"
+$batPath = Join-Path $binDir "gpg-bridge-launch.bat"
 $sentinelStart = "# >>> gpg-bridge >>>"
 $sentinelEnd = "# <<< gpg-bridge <<<"
+$enc = [System.Text.Encoding]::ASCII
+
+# Helper: write text with ASCII encoding (avoids UTF-16 BOM on PS 5.1)
+function Write-Ascii($Path, $Content, $Append = $false) {
+    if ($Append -and (Test-Path $Path)) {
+        [System.IO.File]::AppendAllText($Path, $Content, $enc)
+    } else {
+        [System.IO.File]::WriteAllText($Path, $Content, $enc)
+    }
+}
 
 # ============================================================
 # Uninstall
@@ -71,26 +90,25 @@ if ($Uninstall) {
     $proc = Get-Process -Name "gpg-bridge" -ErrorAction SilentlyContinue
     if ($proc) {
         $proc | Stop-Process -Force
-        Write-Host "  Stopped gpg-bridge process (PID $($proc.Id))" -ForegroundColor Green
+        Write-Host "  Stopped gpg-bridge process" -ForegroundColor Green
     } else {
         Write-Host "  No running gpg-bridge process" -ForegroundColor Yellow
     }
 
     # 2. Unregister scheduled task
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task) {
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         Write-Host "  Unregistered scheduled task '$taskName'" -ForegroundColor Green
     } else {
         Write-Host "  No scheduled task '$taskName' found" -ForegroundColor Yellow
     }
 
-    # 3. Delete binary
-    if (Test-Path $exePath) {
-        Remove-Item $exePath -Force
-        Write-Host "  Deleted $exePath" -ForegroundColor Green
-    } else {
-        Write-Host "  No binary at $exePath" -ForegroundColor Yellow
+    # 3. Delete binary + launcher (.bat and legacy .vbs)
+    foreach ($f in @($exePath, $batPath, (Join-Path $binDir "gpg-bridge-launch.vbs"))) {
+        if (Test-Path $f) {
+            Remove-Item $f -Force
+            Write-Host "  Deleted $f" -ForegroundColor Green
+        }
     }
 
     # 4. Remove sentinel-tagged SSH config block
@@ -98,20 +116,22 @@ if ($Uninstall) {
     if (Test-Path $sshConfig) {
         $raw = Get-Content $sshConfig -Raw
         $pattern = "(?ms)`r?`n?$([regex]::Escape($sentinelStart)).*?$([regex]::Escape($sentinelEnd))`r?`n?"
+        $modified = $false
         if ($raw -match $pattern) {
             $raw = $raw -replace $pattern, ""
-            Set-Content -Path $sshConfig -Value $raw.TrimEnd() -NoNewline
-            Write-Host "  Removed gpg-bridge block from $sshConfig" -ForegroundColor Green
-        } else {
-            Write-Host "  No gpg-bridge sentinel block in $sshConfig" -ForegroundColor Yellow
+            $modified = $true
         }
-
         # Also remove injected lines from existing Host blocks (non-sentinel case)
-        $injectPattern = "(?m)`r?`n?    RemoteForward [^\n]*gpg-agent[^\n]*127\.0\.0\.1:$Port[^\n]*`r?`n?    ExitOnForwardFailure yes"
+        $injectPattern = "(?m)`r?`n?[ \t]*RemoteForward [^\n]*gpg-agent[^\n]*127\.0\.0\.1:$Port[^\n]*`r?`n?[ \t]*ExitOnForwardFailure yes"
         if ($raw -match $injectPattern) {
             $raw = $raw -replace $injectPattern, ""
-            Set-Content -Path $sshConfig -Value $raw.TrimEnd() -NoNewline
-            Write-Host "  Removed injected forward lines from existing Host block" -ForegroundColor Green
+            $modified = $true
+        }
+        if ($modified) {
+            Write-Ascii -Path $sshConfig -Content $raw.TrimEnd() + "`n"
+            Write-Host "  Removed gpg-bridge block from $sshConfig" -ForegroundColor Green
+        } else {
+            Write-Host "  No gpg-bridge block in $sshConfig" -ForegroundColor Yellow
         }
     }
 
@@ -152,25 +172,26 @@ if (Test-Path $exePath) {
     try {
         Invoke-WebRequest -Uri $releaseUrl -OutFile $exePath -UseBasicParsing
 
-        # Verify SHA256
+        # Verify SHA256 — failure is fatal, NOT swallowed
         $sha256File = Join-Path $env:TEMP "gpg-bridge.exe.sha256"
-        try {
-            Invoke-WebRequest -Uri $sha256Url -OutFile $sha256File -UseBasicParsing
-            $expectedHash = (Get-Content $sha256File -Raw).Trim().Split(' ')[0].Trim().ToLower()
-            $actualHash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
-            if ($expectedHash -eq $actualHash) {
-                Write-Host "  SHA256 verified: $actualHash" -ForegroundColor Green
-            } else {
-                Remove-Item $exePath -Force -ErrorAction SilentlyContinue
-                throw "SHA256 mismatch! Expected: $expectedHash`nGot: $actualHash`nDownload may be corrupted or tampered. Re-run or download manually from https://github.com/$repo/releases"
-            }
-        } catch {
-            Write-Host "  WARNING: Could not verify SHA256 ($($_.Exception.Message))" -ForegroundColor Yellow
-            Write-Host "  Binary installed without checksum verification" -ForegroundColor Yellow
+        Invoke-WebRequest -Uri $sha256Url -OutFile $sha256File -UseBasicParsing
+        $expectedHash = (Get-Content $sha256File -Raw).Trim().Split(' ')[0].Trim().ToLower()
+        if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+            Remove-Item $exePath -Force -ErrorAction SilentlyContinue
+            throw "SHA256 file is empty or malformed"
         }
+        $actualHash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
+        if ($expectedHash -ne $actualHash) {
+            Remove-Item $exePath -Force -ErrorAction SilentlyContinue
+            throw "SHA256 mismatch! Expected: $expectedHash`nGot: $actualHash`nDownload may be corrupted or tampered."
+        }
+        Write-Host "  SHA256 verified: $actualHash" -ForegroundColor Green
         Write-Host "  Downloaded to $exePath" -ForegroundColor Green
     } catch {
-        Write-Host "  Download from releases failed. Trying cargo install..." -ForegroundColor Yellow
+        # Download or verification failed — try cargo fallback
+        if (Test-Path $exePath) { Remove-Item $exePath -Force -ErrorAction SilentlyContinue }
+        Write-Host "  Download/verify from releases failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  Trying cargo install..." -ForegroundColor Yellow
         $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin\gpg-bridge.exe"
         try {
             cargo install --git "https://github.com/$repo" 2>&1 | Out-Null
@@ -189,36 +210,36 @@ if (Test-Path $exePath) {
 # --- 2. Register scheduled task (auto-start on login) ---
 Write-Host "`n[2/4] Registering scheduled task..." -ForegroundColor Cyan
 
-# Check port conflict
-$existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-if ($existing) {
-    $owner = (Get-Process -Id $existing.OwningProcess -ErrorAction SilentlyContinue).Name
-    if ($owner -ne "gpg-bridge") {
-        Write-Warning "Port $Port is held by '$owner' (PID $($existing.OwningProcess)), not gpg-bridge. Pick a different -Port or stop that process."
-    } else {
+# Check port conflict (handle multiple listeners gracefully)
+$existing = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+$alreadyRunning = $false
+if ($existing.Count -gt 0) {
+    $owner = (Get-Process -Id $existing[0].OwningProcess -ErrorAction SilentlyContinue).Name
+    if ($owner -eq "gpg-bridge") {
+        $alreadyRunning = $true
         Write-Host "  gpg-bridge already listening on port $Port" -ForegroundColor Yellow
+    } else {
+        Write-Warning "Port $Port is held by '$owner' (PID $($existing[0].OwningProcess)), not gpg-bridge. Pick a different -Port or stop that process."
     }
 }
 
-# Use conhost wrapper to hide console window on login
-$hiddenLauncher = Join-Path $binDir "gpg-bridge-launch.vbs"
-$vbsContent = @"
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """$exePath"" --agent 127.0.0.1:$Port", 0, False
-"@
-Set-Content -Path $hiddenLauncher -Value $vbsContent -Encoding ASCII
+# Build .bat launcher (hides console window, no VBS injection risk)
+$batContent = "@echo off`r`nstart `"`" /b `"`"$exePath`"`" --agent 127.0.0.1:$Port`r`n"
+Write-Ascii -Path $batPath -Content $batContent
 
-$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument """$hiddenLauncher"""
+$action = New-ScheduledTaskAction -Execute $batPath
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 try {
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-    # Start hidden (not via Start-ScheduledTask which pops a console window)
-    Start-Process -FilePath $exePath -ArgumentList "--agent 127.0.0.1:$Port" -WindowStyle Hidden
-    Start-Sleep 2
+    # Start gpg-bridge now (hidden), but only if not already running
+    if (-not $alreadyRunning) {
+        Start-Process -FilePath $exePath -ArgumentList "--agent", "127.0.0.1:$Port" -WindowStyle Hidden
+        Start-Sleep 2
+    }
     $listening = (Test-NetConnection 127.0.0.1 -Port $Port -WarningAction SilentlyContinue).TcpTestSucceeded
     if ($listening) {
         Write-Host "  Task registered, gpg-bridge listening on 127.0.0.1:$Port" -ForegroundColor Green
@@ -228,7 +249,7 @@ try {
 } catch {
     Write-Warning "Scheduled task registration failed: $($_.Exception.Message)"
     Write-Host "  Register manually:" -ForegroundColor Yellow
-    Write-Host "    Register-ScheduledTask -TaskName $taskName -Action (New-ScheduledTaskAction -Execute `"$exePath`" -Argument `"--agent 127.0.0.1:$Port`") -Trigger (New-ScheduledTaskTrigger -AtLogOn)"
+    Write-Host "    Register-ScheduledTask -TaskName $taskName -Action (New-ScheduledTaskAction -Execute `"$batPath`") -Trigger (New-ScheduledTaskTrigger -AtLogOn)"
     throw
 }
 
@@ -253,7 +274,7 @@ if (Test-Path $agentConf) {
 }
 
 if ($needAdd) {
-    Add-Content -Path $agentConf -Value "allow-loopback-pinentry"
+    Write-Ascii -Path $agentConf -Content "allow-loopback-pinentry`n" -Append $true
     Write-Host "  Added allow-loopback-pinentry to $agentConf" -ForegroundColor Green
     & gpg-connect-agent killagent /bye 2>$null | Out-Null
     Start-Sleep 1
@@ -272,38 +293,42 @@ if (-not (Test-Path (Split-Path $sshConfig))) {
 $forwardLine = "    RemoteForward $RemoteSocket 127.0.0.1:$Port"
 $exitLine = "    ExitOnForwardFailure yes"
 $hostLine = if ($RemoteIP) { "Host $RemoteHost $RemoteIP" } else { "Host $RemoteHost" }
+$escHost = [regex]::Escape($RemoteHost)
 
 $needAdd = $true
+$raw = $null
 if (Test-Path $sshConfig) {
     $raw = Get-Content $sshConfig -Raw
-    # Match full forward line (not just socket path) so different ports are detected
-    if ($raw -match [regex]::Escape($forwardLine.Trim())) {
+    # Check if forward already present in the target Host block (not just anywhere)
+    $blockPattern = '(?ms)^Host\s+(?:[^\n]*\s)?' + $escHost + '(?=\s|$)[^\n]*$(.*?)(?=^Host\s|\z)'
+    if ($raw -match $blockPattern -and $matches[1] -match [regex]::Escape($forwardLine.Trim())) {
         $needAdd = $false
-        Write-Host "  RemoteForward already present in $sshConfig (skip)" -ForegroundColor Yellow
+        Write-Host "  RemoteForward already present for '$RemoteHost' (skip)" -ForegroundColor Yellow
     }
 }
 
 if ($needAdd) {
-    if (Test-Path $sshConfig -and $raw) {
+    if ($raw) {
         # Check if Host block for this alias already exists
-        $hostPattern = "(?m)^(Host\s+[^\n]*\b$([regex]::Escape($RemoteHost))\b[^\n]*)$"
+        # Use lookahead to ensure alias is followed by whitespace or EOL (not a subdomain)
+        $hostPattern = '(?m)^(Host\s+[^\n]*\b' + $escHost + '(?=\s|$)[^\n]*)$'
         if ($raw -match $hostPattern) {
             # Inject lines into existing Host block
             $injected = "`n$forwardLine`n$exitLine"
             $raw = $raw -replace $hostPattern, "`$1$injected"
-            Set-Content -Path $sshConfig -Value $raw.TrimEnd() -NoNewline
+            Write-Ascii -Path $sshConfig -Content $raw.TrimEnd() + "`n"
             Write-Host "  Injected RemoteForward into existing '$RemoteHost' block" -ForegroundColor Green
         } else {
             # Append sentinel-tagged new block
             $block = "`n`n$sentinelStart`n$hostLine`n    # TODO: set HostName and User for this remote`n$forwardLine`n$exitLine`n$sentinelEnd`n"
-            Add-Content -Path $sshConfig -Value $block
+            Write-Ascii -Path $sshConfig -Content $block -Append $true
             Write-Host "  Added new SSH config block for $RemoteHost" -ForegroundColor Green
             Write-Host "  NOTE: Edit $sshConfig to set HostName and User" -ForegroundColor Yellow
         }
     } else {
         # Create new config file
         $block = "$sentinelStart`n$hostLine`n    # TODO: set HostName and User for this remote`n$forwardLine`n$exitLine`n$sentinelEnd`n"
-        Set-Content -Path $sshConfig -Value $block.TrimStart()
+        Write-Ascii -Path $sshConfig -Content $block
         Write-Host "  Created $sshConfig with $RemoteHost block" -ForegroundColor Green
         Write-Host "  NOTE: Edit $sshConfig to set HostName and User" -ForegroundColor Yellow
     }
@@ -314,6 +339,7 @@ Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  gpg-bridge.exe : $exePath"
+Write-Host "  Launcher       : $batPath"
 Write-Host "  Scheduled task : $taskName (auto-starts on login)"
 Write-Host "  gpg-agent.conf : $agentConf"
 Write-Host "  SSH config     : $sshConfig"
@@ -328,5 +354,6 @@ Write-Host ""
 Write-Host "  Test: ssh $RemoteHost" -ForegroundColor Green
 Write-Host "        gpg --card-status" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Uninstall: iex `"& { `$(`$irm https://raw.githubusercontent.com/$repo/master/bootstrap-gpg-bridge.ps1) } -Uninstall`"" -ForegroundColor DarkGray
+Write-Host "  Uninstall:" -ForegroundColor DarkGray
+Write-Host "    iex `"& { `$(`$irm https://raw.githubusercontent.com/$repo/master/bootstrap-gpg-bridge.ps1) } -Uninstall`""
 Write-Host ""

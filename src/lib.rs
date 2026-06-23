@@ -48,7 +48,8 @@ async fn load_gpg_socket_path(ty: SocketType) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
-                "failed to load extra socket: {:?}",
+                "failed to load {}: {:?}",
+                ty.name(),
                 String::from_utf8_lossy(&output.stderr)
             ),
         ));
@@ -254,7 +255,9 @@ where
         tokio::spawn(async move {
             if let Err(e) = delegate(conn, port, nounce).await {
                 error!("failed to delegate stream: {:?}", e);
-                meta.lock().await.args.take();
+                let mut m = meta.lock().await;
+                m.args.take();
+                m.path.take();
             }
         });
     }

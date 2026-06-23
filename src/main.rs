@@ -33,6 +33,11 @@ struct GpgBridge {
 async fn main() -> io::Result<()> {
     pretty_env_logger::init();
     let cfg = GpgBridge::parse();
+    if cfg.ssh.is_none() && cfg.extra.is_none() && cfg.agent.is_none() {
+        eprintln!("error: at least one of --ssh, --extra, or --agent must be specified");
+        eprintln!("       run with --help for usage");
+        std::process::exit(2);
+    }
     if cfg.detach {
         let _ = gpg_bridge::ping_gpg_agent().await;
 
