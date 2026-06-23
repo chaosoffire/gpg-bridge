@@ -10,14 +10,20 @@ use std::{env, io};
 #[command(version, about)]
 struct GpgBridge {
     /// Sets the listenning address to bridge the ssh socket
-    #[arg(long, value_name("ADDRESS"), required_unless_present("extra"))]
+    #[arg(long, value_name("ADDRESS"))]
     ssh: Option<String>,
     /// Sets the listenning to bridge the extra socket
-    #[arg(long, value_name("ADDRESS"), required_unless_present("ssh"))]
+    #[arg(long, value_name("ADDRESS"))]
     extra: Option<String>,
+    /// Sets the listenning to bridge the main agent socket (full access, includes card)
+    #[arg(long, value_name("ADDRESS"))]
+    agent: Option<String>,
     /// Sets the path to gnupg extra socket optionaly
     #[arg(long, value_name("PATH"))]
     extra_socket: Option<String>,
+    /// Sets the path to gnupg agent socket optionaly
+    #[arg(long, value_name("PATH"))]
+    agent_socket: Option<String>,
     /// Runs the program as a background daemon
     #[arg(long)]
     detach: bool,
@@ -57,7 +63,14 @@ async fn main() -> io::Result<()> {
         }
         Ok(())
     };
-    match tokio::try_join!(ssh_task, extra_task) {
+    let (agent_from, agent_to) = (cfg.agent, cfg.agent_socket);
+    let agent_task = async move {
+        if let Some(from_addr) = agent_from {
+            return gpg_bridge::bridge(SocketType::Agent, from_addr, agent_to).await;
+        }
+        Ok(())
+    };
+    match tokio::try_join!(ssh_task, extra_task, agent_task) {
         Ok(_) => Ok(()),
         Err(e) => return Err(other_error(format!("failed to join tasks {:?}", e))),
     }

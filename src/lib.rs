@@ -25,6 +25,7 @@ struct AgentMeta {
 pub enum SocketType {
     Ssh,
     Extra,
+    Agent,
 }
 
 impl SocketType {
@@ -32,6 +33,7 @@ impl SocketType {
         match self {
             SocketType::Ssh => "agent-ssh-socket",
             SocketType::Extra => "agent-extra-socket",
+            SocketType::Agent => "agent-socket",
         }
     }
 }
@@ -218,13 +220,14 @@ where
     L::Connection: SplitStream + Send + 'static,
 {
     match ty {
-        SocketType::Extra => bridge_to_stream(listener, to_path).await?,
+        SocketType::Extra => bridge_to_stream(listener, ty, to_path).await?,
+        SocketType::Agent => bridge_to_stream(listener, ty, to_path).await?,
         SocketType::Ssh => bridge_to_message(listener).await?,
     }
     Ok(())
 }
 
-async fn bridge_to_stream<L>(mut listener: L, to_path: Option<String>) -> io::Result<()>
+async fn bridge_to_stream<L>(mut listener: L, ty: SocketType, to_path: Option<String>) -> io::Result<()>
 where
     L: Listener,
     L::Connection: SplitStream + Send + 'static,
@@ -241,7 +244,7 @@ where
             let mut m = meta.lock().await;
             if m.args.is_none() {
                 if m.path.is_none() {
-                    m.path = Some(load_gpg_socket_path(SocketType::Extra).await?);
+                    m.path = Some(load_gpg_socket_path(ty).await?);
                 }
                 m.args = Some(load_port_nounce(m.path.as_ref().unwrap()).await?);
             }

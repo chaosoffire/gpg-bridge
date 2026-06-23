@@ -83,7 +83,7 @@ impl<'a> AsyncWrite for PipeServerWrite<'a> {
             match self.server.try_write(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if let Err(e) = ready!(self.server.poll_read_ready(cx)) {
+                    if let Err(e) = ready!(self.server.poll_write_ready(cx)) {
                         return Poll::Ready(Err(e));
                     }
                 }
