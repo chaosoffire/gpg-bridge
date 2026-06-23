@@ -23,9 +23,7 @@ remote Linux machine over SSH.
 - **Windows machine** with [Gpg4win](https://gpg4win.org/) installed
   (includes `gpg-agent.exe`, `gpgconf`, etc.)
 - **Windows OpenSSH** (`ssh.exe`, comes with Windows 10/11)
-- **Rust toolchain** (`cargo`) to build, OR download a prebuilt binary
-  from the [GitHub Actions artifacts](https://docs.github.com/en/actions/managing-workflow-runs/downloading-workflow-artifacts)
-- A **Linux remote** you SSH into, with `socat` installed
+- A **Linux remote** you SSH into
 - A GPG keypair — either:
   - A **Yubikey** (or other OpenPGP smartcard) with keys loaded, OR
   - **Software keys** stored in your local GnuPG keyring (`gpg --gen-key`)
@@ -34,10 +32,106 @@ remote Linux machine over SSH.
 > forwards the gpg-agent protocol; how the agent accesses the key
 > (smartcard vs keyring) is transparent.
 
-### Step 1: Build and install gpg-bridge on Windows
+### One-line install (recommended)
+
+Run this in PowerShell on your Windows machine:
 
 ```powershell
-# Option A: Build from source (recommended)
+irm https://raw.githubusercontent.com/chaosoffire/gpg-bridge/master/bootstrap-gpg-bridge.ps1 | iex
+```
+
+This downloads the prebuilt binary from [GitHub Releases](https://github.com/chaosoffire/gpg-bridge/releases)
+(verifies SHA256 checksum), installs it to `~/bin/gpg-bridge.exe`,
+registers a scheduled task for auto-start on login, configures
+`gpg-agent.conf` with `allow-loopback-pinentry`, and patches
+`~/.ssh/config` with the `RemoteForward` line.
+
+**With custom parameters** (different remote host, socket path, or port):
+
+```powershell
+iex "& { $(irm https://raw.githubusercontent.com/chaosoffire/gpg-bridge/master/bootstrap-gpg-bridge.ps1) } -RemoteHost work-server -RemoteSocket /run/user/1001/gnupg/S.gpg-agent -Port 5000"
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-RemoteHost` | `dev.lan` | SSH Host alias in `~/.ssh/config` |
+| `-RemoteSocket` | `/run/user/1000/gnupg/S.gpg-agent` | Unix socket path on remote |
+| `-Port` | `4321` | Local TCP port for gpg-bridge |
+| `-RemoteIP` | *(empty)* | Add IP to Host line so `ssh user@ip` also forwards |
+| `-Uninstall` | *(switch)* | Remove gpg-bridge (see below) |
+
+> **Note:** If you don't have Gpg4win installed yet, the script will
+> warn but continue. Install Gpg4win from https://gpg4win.org/ before
+> using GPG operations.
+
+### Uninstall
+
+```powershell
+iex "& { $(irm https://raw.githubusercontent.com/chaosoffire/gpg-bridge/master/bootstrap-gpg-bridge.ps1) } -Uninstall"
+```
+
+This stops the gpg-bridge process, unregisters the scheduled task,
+deletes the binary, and removes the SSH config block (sentinel-tagged).
+The `allow-loopback-pinentry` line in `gpg-agent.conf` is left in place
+(other tools may need it) — a note is printed if you want to remove it
+manually.
+
+### Remote setup (one-time, on the Linux box)
+
+Only **one** change needed — enable `StreamLocalBindUnlink` so SSH can
+overwrite stale sockets from previous sessions:
+
+```bash
+sudo tee /etc/ssh/sshd_config.d/streamlocal.conf << 'EOF'
+StreamLocalBindUnlink yes
+EOF
+sudo systemctl restart sshd
+```
+
+**No `socat`, no systemd masking, no `gpg.conf` changes, no shell hooks.**
+The remote stays pristine — when you're not SSH'd in, gpg on the remote
+behaves exactly as on a clean install.
+
+### Import your public key on the remote (one-time)
+
+```powershell
+# On Windows: export your public key
+gpg --export --armor <your-key-id> > pubkey.asc
+scp pubkey.asc <remote>:/tmp/
+```
+
+```bash
+# On remote: import
+gpg --import /tmp/pubkey.asc
+```
+
+### Verify
+
+```bash
+# SSH in (use the alias, not the raw IP)
+ssh <your-alias>
+gpg --card-status    # should show your Yubikey or key info
+echo test | gpg --clearsign --local-user <your-key-id>
+```
+
+### (Optional) Git signing on the remote
+
+```bash
+git config --global user.signingkey <your-key-id>
+git config --global commit.gpgsign true
+git config --global gpg.program gpg
+```
+
+---
+
+## Manual install (alternative to one-line script)
+
+If you prefer to set things up manually:
+
+### Step 1: Build or download gpg-bridge
+
+```powershell
+# Option A: Build from source
 cargo install --git https://github.com/chaosoffire/gpg-bridge
 
 # Option B: Build from a local clone
@@ -46,11 +140,11 @@ cd gpg-bridge
 cargo build --release
 # Binary is at target\release\gpg-bridge.exe
 
-# Option C: Download prebuilt binary from GitHub Actions artifacts
-# (see link above)
+# Option C: Download prebuilt binary from GitHub Releases
+# https://github.com/chaosoffire/gpg-bridge/releases
 ```
 
-Copy the binary to a stable location:
+Copy to a stable location:
 
 ```powershell
 mkdir C:\Users\<you>\bin -Force
