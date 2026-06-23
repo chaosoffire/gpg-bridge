@@ -200,7 +200,15 @@ if ($existing) {
     }
 }
 
-$action = New-ScheduledTaskAction -Execute $exePath -Argument "--agent 127.0.0.1:$Port"
+# Use conhost wrapper to hide console window on login
+$hiddenLauncher = Join-Path $binDir "gpg-bridge-launch.vbs"
+$vbsContent = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """$exePath"" --agent 127.0.0.1:$Port", 0, False
+"@
+Set-Content -Path $hiddenLauncher -Value $vbsContent -Encoding ASCII
+
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument """$hiddenLauncher"""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
@@ -208,7 +216,8 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interac
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 try {
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-    Start-ScheduledTask -TaskName $taskName
+    # Start hidden (not via Start-ScheduledTask which pops a console window)
+    Start-Process -FilePath $exePath -ArgumentList "--agent 127.0.0.1:$Port" -WindowStyle Hidden
     Start-Sleep 2
     $listening = (Test-NetConnection 127.0.0.1 -Port $Port -WarningAction SilentlyContinue).TcpTestSucceeded
     if ($listening) {
