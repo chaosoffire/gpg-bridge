@@ -118,10 +118,17 @@ Edit `~/.ssh/config` (i.e. `C:\Users\<you>\.ssh\config`):
 Host my-remote
     HostName <remote-ip-or-hostname>
     User <remote-username>
-    # Forward TCP port instead of Unix socket (Windows can't do streamlocal to GnuPG)
-    RemoteForward 127.0.0.1:4321 127.0.0.1:4321
+    # SSH creates the Unix socket on the remote, forwarding to Windows TCP port
+    RemoteForward /run/user/<uid>/gnupg/S.gpg-agent 127.0.0.1:4321
     ExitOnForwardFailure yes
 ```
+
+Replace `<uid>` with your remote user ID (find it with `id -u` on the
+remote, usually `1000` for the first user).
+
+This uses SSH's **mixed-mode forward**: the remote side is a Unix
+socket (created by sshd), the local side is a TCP port (gpg-bridge).
+No `socat` needed on the remote — SSH does the translation natively.
 
 > **Important:** Always SSH using the **alias** (`ssh my-remote`), not
 > the raw IP (`ssh user@1.2.3.4`). The `RemoteForward` only applies when
@@ -131,64 +138,28 @@ Host my-remote
 `ExitOnForwardFailure yes` ensures SSH aborts if the forward fails,
 instead of silently connecting without the tunnel.
 
-### Step 5: Configure the Linux remote (one-time setup)
+### Step 5: Configure the Linux remote (one-time, minimal)
 
-SSH into the remote and run these once:
-
-```bash
-# Install socat
-sudo apt install -y socat   # Debian/Ubuntu
-# or: sudo dnf install -y socat   # Fedora/RHEL
-
-# Prevent the remote from starting its own gpg-agent
-# (which would steal the socket)
-systemctl --user disable --now gpg-agent.socket gpg-agent-extra.socket gpg-agent-ssh.socket 2>/dev/null
-systemctl --user mask gpg-agent.socket gpg-agent-extra.socket gpg-agent-ssh.socket 2>/dev/null
-
-# Prevent gpg from auto-starting a local agent
-mkdir -p ~/.gnupg
-grep -q no-autostart ~/.gnupg/gpg.conf 2>/dev/null || echo no-autostart >> ~/.gnupg/gpg.conf
-```
-
-Create a bridge script on the remote:
+Only **one** change is needed on the remote — enable `StreamLocalBindUnlink`
+so SSH can overwrite a stale socket from a previous session:
 
 ```bash
-mkdir -p ~/.local/bin
-cat > ~/.local/bin/gpg-agent-bridge.sh << 'EOF'
-#!/bin/bash
-set -e
-SOCKET_PATH="/run/user/$(id -u)/gnupg/S.gpg-agent"
-FORWARDED_PORT=4321
-
-pkill -f "socat.*S.gpg-agent" 2>/dev/null || true
-sleep 0.5
-rm -f "$SOCKET_PATH"
-
-nohup socat UNIX-LISTEN:"$SOCKET_PATH",fork,unlink-early \
-    TCP4:127.0.0.1:$FORWARDED_PORT > /tmp/socat-gpg.log 2>&1 < /dev/null &
-echo "socat bridge started (PID $!), socket: $SOCKET_PATH -> 127.0.0.1:$FORWARDED_PORT"
-
-sleep 0.5
-if [ -S "$SOCKET_PATH" ]; then
-    echo "Socket ready: $SOCKET_PATH"
-else
-    echo "ERROR: Socket not created. Check /tmp/socat-gpg.log"
-    exit 1
-fi
+# Add to sshd config (drop-in file, doesn't modify the main config)
+sudo tee /etc/ssh/sshd_config.d/streamlocal.conf << 'EOF'
+StreamLocalBindUnlink yes
 EOF
-chmod +x ~/.local/bin/gpg-agent-bridge.sh
+sudo systemctl restart sshd
 ```
 
-Add auto-start to your shell config (`.zshrc` or `.bashrc`):
+That's it. **No `socat`, no systemd masking, no `gpg.conf` changes, no
+shell hooks.** The remote stays pristine — when you SSH without the
+forwarding alias (or don't SSH at all), gpg on the remote behaves
+exactly as it would on a clean install.
 
-```bash
-# Auto-start gpg-agent bridge for SSH forwarding
-echo '' >> ~/.zshrc
-echo '# Auto-start gpg-agent bridge for SSH forwarding' >> ~/.zshrc
-echo '[ -S /run/user/$(id -u)/gnupg/S.gpg-agent ] || ~/.local/bin/gpg-agent-bridge.sh > /dev/null 2>&1' >> ~/.zshrc
-```
-
-> If you use bash instead of zsh, replace `.zshrc` with `.bashrc`.
+> **Why this is non-polluting:** SSH only creates the Unix socket while
+> the session is alive. When you disconnect, sshd cleans up the socket
+> and the remote's systemd gpg-agent sockets return to normal. There's
+> no persistent modification to the remote's gpg environment.
 
 ### Step 6: Import your public key on the remote (one-time)
 
@@ -240,25 +211,29 @@ Remote (Linux)                    SSH tunnel                 Windows
 │ Unix socket  │                                            │   keyring)       │
 │ S.gpg-agent  │                                            │ Yubikey / keys   │
 │   ↓          │                                            │                  │
-│ socat        │                                            │ gpg-bridge.exe   │
-│ TCP→127.0.0.1│──SSH──→ 127.0.0.1:4321 ──→ 127.0.0.1:4321 │ reads nonce file │
-│   :4321      │           (remote end)      (local end)      │ does handshake   │
+│ sshd creates │──SSH──→ Unix→TCP ──→ 127.0.0.1:4321        │ gpg-bridge.exe   │
+│ & manages    │           (native SSH      (gpg-bridge     │ reads nonce file │
+│ the socket   │            translation)     listens here)   │ does handshake   │
 │              │                                            │ pumps bytes       │
 └──────────────┘                                            └──────────────────┘
 ```
 
 1. `gpg` on remote connects to the Unix socket `S.gpg-agent`
-2. `socat` forwards that to TCP `127.0.0.1:4321`
-3. SSH `RemoteForward` tunnels that TCP port to Windows `127.0.0.1:4321`
-4. `gpg-bridge.exe` receives the connection, reads the `S.gpg-agent`
+2. SSH's `RemoteForward` (mixed Unix→TCP mode) translates the Unix
+   socket traffic to TCP and tunnels it to Windows `127.0.0.1:4321`
+3. `gpg-bridge.exe` receives the connection, reads the `S.gpg-agent`
    file (which contains the real port + 16-byte nonce), connects to
    `gpg-agent.exe` on that port, sends the nonce as handshake, then
    pumps bytes bidirectionally
-5. `gpg-agent.exe` accesses the key (Yubikey via PC/SC, or software
+4. `gpg-agent.exe` accesses the key (Yubikey via PC/SC, or software
    keyring) and returns the result
 
 The key never leaves your Windows machine. Only the gpg-agent protocol
 travels through the encrypted SSH tunnel.
+
+**No `socat` on the remote.** SSH natively bridges Unix socket → TCP
+in this configuration. When the SSH session ends, sshd cleans up the
+Unix socket automatically — the remote's gpg environment is untouched.
 
 ---
 
@@ -268,12 +243,10 @@ travels through the encrypted SSH tunnel.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `gpg: no gpg-agent running` | socat died on remote | `~/.local/bin/gpg-agent-bridge.sh` |
 | `gpg: End of file` / `No agent running` | SSH forward not active (used IP instead of alias, or gpg-bridge died on Windows) | Use `ssh <alias>` not `ssh user@ip`; check `Test-NetConnection 127.0.0.1 -Port 4321` on Windows |
 | `gpg: OpenPGP card not available: Forbidden` | gpg-bridge running with `--extra` instead of `--agent` | Restart with `--agent` flag |
-| `ssh: remote port forwarding failed` | Stale socket from previous session on remote | `ssh <remote> 'pkill -f "socat.*S.gpg-agent"; rm -f /run/user/$(id -u)/gnupg/S.gpg-agent'` then reconnect |
+| `ssh: remote port forwarding failed` | Stale socket from previous session on remote | See section below |
 | PIN prompt on remote instead of Windows | `allow-loopback-pinentry` not applied | Add to gpg-agent.conf, restart agent: `gpg-connect-agent killagent /bye; gpg-connect-agent /bye` |
-| `remote port forwarding failed: listen 127.0.0.1:4321` | Another SSH session already holding the port | Close old sessions or use `ExitOnForwardFailure yes` to fail fast |
 | `No secret key` when signing | Public key not imported on remote | `gpg --import pubkey.asc` on remote |
 
 ### "Error: remote port forwarding failed for listen port 4321"
@@ -316,14 +289,14 @@ fails loudly instead of silently connecting without the tunnel:
 
 ```sshconfig
 Host my-remote
-    RemoteForward 127.0.0.1:4321 127.0.0.1:4321
+    RemoteForward /run/user/<uid>/gnupg/S.gpg-agent 127.0.0.1:4321
     ExitOnForwardFailure yes
 ```
 
 ### "gpg: can't connect to the gpg-agent: End of file"
 
-The remote socat is running but has nothing to connect to on the other
-side of the SSH tunnel. Causes:
+The SSH forward created the Unix socket on the remote, but there's
+nothing listening on the other side. Causes:
 
 1. **You used `ssh user@ip` instead of `ssh <alias>`** — the
    `RemoteForward` only applies to the Host alias in your SSH config.
@@ -352,8 +325,10 @@ Test-NetConnection 127.0.0.1 -Port 4321   # should be True
 ```
 
 ```bash
-# Remote: restart socat
-~/.local/bin/gpg-agent-bridge.sh
+# Remote: just reconnect — SSH recreates the socket automatically
+# No socat to restart, no scripts to run
+exit  # disconnect
+ssh my-remote  # reconnect
 gpg --card-status   # verify
 ```
 
