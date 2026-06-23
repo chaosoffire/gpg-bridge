@@ -264,6 +264,8 @@ travels through the encrypted SSH tunnel.
 
 ## Troubleshooting
 
+### Common issues
+
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `gpg: no gpg-agent running` | socat died on remote | `~/.local/bin/gpg-agent-bridge.sh` |
@@ -273,6 +275,72 @@ travels through the encrypted SSH tunnel.
 | PIN prompt on remote instead of Windows | `allow-loopback-pinentry` not applied | Add to gpg-agent.conf, restart agent: `gpg-connect-agent killagent /bye; gpg-connect-agent /bye` |
 | `remote port forwarding failed: listen 127.0.0.1:4321` | Another SSH session already holding the port | Close old sessions or use `ExitOnForwardFailure yes` to fail fast |
 | `No secret key` when signing | Public key not imported on remote | `gpg --import pubkey.asc` on remote |
+
+### "Error: remote port forwarding failed for listen port 4321"
+
+This is the most common issue. It happens when a previous SSH session
+died ungracefully (closed terminal window, network drop, etc.) but the
+remote `sshd-session` process is still alive and holding the port.
+
+**Immediate fix:**
+
+```bash
+# SSH in without forwarding, kill stale sessions, reconnect
+ssh -o ClearAllForwardings=yes <remote> "pkill -u $USER -f sshd-session -o OLD"
+ssh <remote>
+```
+
+**Permanent fix (recommended) — configure sshd to auto-kill dead sessions:**
+
+On the remote, create a drop-in sshd config:
+
+```bash
+sudo tee /etc/ssh/sshd_config.d/alive.conf << 'EOF'
+ClientAliveInterval 30
+ClientAliveCountMax 3
+EOF
+
+# Debian/Ubuntu:
+sudo systemctl restart sshd
+
+# RHEL/Fedora:
+sudo systemctl restart sshd
+```
+
+This makes sshd send a keepalive ping every 30 seconds. If the client
+doesn't respond 3 times in a row (90 seconds — e.g. after a network
+drop or closed terminal), sshd kills the session and releases the port.
+
+**Also ensure `ExitOnForwardFailure yes` is in your SSH config** so SSH
+fails loudly instead of silently connecting without the tunnel:
+
+```sshconfig
+Host my-remote
+    RemoteForward 127.0.0.1:4321 127.0.0.1:4321
+    ExitOnForwardFailure yes
+```
+
+### "gpg: can't connect to the gpg-agent: End of file"
+
+The remote socat is running but has nothing to connect to on the other
+side of the SSH tunnel. Causes:
+
+1. **You used `ssh user@ip` instead of `ssh <alias>`** — the
+   `RemoteForward` only applies to the Host alias in your SSH config.
+   Always connect using the alias, or add the IP to the Host line:
+   ```sshconfig
+   Host my-remote 10.0.10.2
+   ```
+2. **gpg-bridge died on Windows** — check with:
+   ```powershell
+   Test-NetConnection 127.0.0.1 -Port 4321
+   # If False: Start-ScheduledTask -TaskName gpg-bridge
+   ```
+3. **Windows just rebooted and the scheduled task hasn't fired yet** —
+   wait a few seconds or start it manually:
+   ```powershell
+   Start-ScheduledTask -TaskName gpg-bridge
+   ```
 
 ### Manual recovery
 
