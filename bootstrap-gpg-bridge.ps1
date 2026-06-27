@@ -228,9 +228,10 @@ $batContent = "@echo off`r`nstart `"`" /b `"`"$exePath`"`" --agent 127.0.0.1:$Po
 Write-Ascii -Path $batPath -Content $batContent
 
 $action = New-ScheduledTaskAction -Execute $batPath
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$taskUser = "$env:USERDOMAIN\$env:USERNAME"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 try {
@@ -249,7 +250,7 @@ try {
 } catch {
     Write-Warning "Scheduled task registration failed: $($_.Exception.Message)"
     Write-Host "  Register manually:" -ForegroundColor Yellow
-    Write-Host "    Register-ScheduledTask -TaskName $taskName -Action (New-ScheduledTaskAction -Execute `"$batPath`") -Trigger (New-ScheduledTaskTrigger -AtLogOn)"
+    Write-Host "    Register-ScheduledTask -TaskName $taskName -Action (New-ScheduledTaskAction -Execute `"$batPath`") -Trigger (New-ScheduledTaskTrigger -AtLogOn -User `"$taskUser`") -Principal (New-ScheduledTaskPrincipal -UserId `"$taskUser`" -LogonType Interactive -RunLevel Limited)"
     throw
 }
 
