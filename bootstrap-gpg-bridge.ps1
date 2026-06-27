@@ -227,7 +227,9 @@ if ($existing.Count -gt 0) {
 $batContent = "@echo off`r`nstart `"`" /b `"`"$exePath`"`" --agent 127.0.0.1:$Port`r`n"
 Write-Ascii -Path $batPath -Content $batContent
 
-$action = New-ScheduledTaskAction -Execute $batPath
+# Launch via powershell.exe -WindowStyle Hidden so no CMD black window appears on login
+$psArgs = "-WindowStyle Hidden -NoProfile -Command Start-Process -WindowStyle Hidden -FilePath `"$exePath`" -ArgumentList `"--agent 127.0.0.1:$Port`""
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
 $taskUser = "$env:USERDOMAIN\$env:USERNAME"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
